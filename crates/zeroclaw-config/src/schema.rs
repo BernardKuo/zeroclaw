@@ -9995,6 +9995,45 @@ fn expand_tilde_path(path: &str) -> PathBuf {
     PathBuf::from(expanded_str)
 }
 
+/// Detect if the executable lives under a Homebrew prefix and return the
+/// corresponding `var/zeroclaw` directory.
+///
+/// Homebrew installs binaries into `<prefix>/Cellar/<formula>/<version>/bin/`
+/// and symlinks them to `<prefix>/bin/`. The canonical `var` directory is
+/// `<prefix>/var`.  We check for both layouts.
+fn detect_homebrew_var_dir(exe: &Path) -> Option<PathBuf> {
+    let path_str = exe.to_string_lossy();
+
+    // Symlinked binary: <prefix>/bin/zeroclaw
+    // Cellar binary:    <prefix>/Cellar/zeroclaw/<version>/bin/zeroclaw
+    let prefix = if path_str.contains("/Cellar/") {
+        // Walk up from .../Cellar/zeroclaw/<ver>/bin/zeroclaw to the prefix
+        let mut ancestor = exe.to_path_buf();
+        while let Some(parent) = ancestor.parent() {
+            ancestor = parent.to_path_buf();
+            if ancestor.file_name().is_some_and(|n| n == "Cellar") {
+                // prefix is one level above Cellar
+                return ancestor.parent().map(|p| p.join("var").join("zeroclaw"));
+            }
+        }
+        return None;
+    } else if let Some(bin_parent) = exe.parent() {
+        // <prefix>/bin/zeroclaw → check if <prefix>/Cellar exists (Homebrew marker)
+        if let Some(prefix) = bin_parent.parent() {
+            if prefix.join("Cellar").is_dir() {
+                Some(prefix.to_path_buf())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    prefix.map(|p| p.join("var").join("zeroclaw"))
+}
+
 async fn resolve_runtime_config_dirs(
     default_zeroclaw_dir: &Path,
     default_workspace_dir: &Path,
@@ -10021,6 +10060,21 @@ async fn resolve_runtime_config_dirs(
             workspace_dir,
             ConfigResolutionSource::EnvWorkspace,
         ));
+    }
+
+    if cfg!(target_os = "macos") {
+        // Ensure the Homebrew var directory exists before launchd tries to use it.
+        // The plist may reference this path for WorkingDirectory and log files.
+        let exe = std::env::current_exe().ok();
+        if let Some(ref exe_path) = exe
+            && let Some(var_dir) = detect_homebrew_var_dir(exe_path)
+        {
+            return Ok((
+                var_dir.clone(),
+                var_dir.join("workspace"),
+                ConfigResolutionSource::EnvWorkspace,
+            ));
+        }
     }
 
     if let Some((zeroclaw_dir, workspace_dir)) =
