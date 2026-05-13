@@ -9953,6 +9953,7 @@ enum ConfigResolutionSource {
     EnvWorkspace,
     ActiveWorkspaceMarker,
     DefaultConfigDir,
+    HomebrewConfigDir,
 }
 
 impl ConfigResolutionSource {
@@ -9962,6 +9963,7 @@ impl ConfigResolutionSource {
             Self::EnvWorkspace => "ZEROCLAW_WORKSPACE",
             Self::ActiveWorkspaceMarker => "active_workspace.toml",
             Self::DefaultConfigDir => "default",
+            Self::HomebrewConfigDir => "homebrew",
         }
     }
 }
@@ -9996,42 +9998,49 @@ fn expand_tilde_path(path: &str) -> PathBuf {
 }
 
 /// Detect if the executable lives under a Homebrew prefix and return the
-/// corresponding `var/zeroclaw` directory.
-///
+/// corresponding configuration directories.
 /// Homebrew installs binaries into `<prefix>/Cellar/<formula>/<version>/bin/`
 /// and symlinks them to `<prefix>/bin/`. The canonical `var` directory is
-/// `<prefix>/var`.  We check for both layouts.
-fn detect_homebrew_var_dir(exe: &Path) -> Option<PathBuf> {
-    let path_str = exe.to_string_lossy();
+/// `<prefix>/var`. We check for both layouts.
+fn try_resolve_homebrew_config_dirs() -> Option<(PathBuf, PathBuf, ConfigResolutionSource)> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+
+    let exe = std::env::current_exe().ok()?;
+    let mut current: &Path = &exe;
+
+    // Cellar binary:    <prefix>/Cellar/zeroclaw/<version>/bin/zeroclaw
+    while let Some(parent) = current.parent() {
+        if current.file_name() == Some(std::ffi::OsStr::new("Cellar")) {
+            // We found <prefix>/Cellar. The prefix is the parent.
+            let var_dir = parent.join("var").join("zeroclaw");
+            return Some((
+                var_dir.clone(),
+                var_dir.join("workspace"),
+                ConfigResolutionSource::HomebrewConfigDir,
+            ));
+        }
+        current = parent;
+    }
 
     // Symlinked binary: <prefix>/bin/zeroclaw
-    // Cellar binary:    <prefix>/Cellar/zeroclaw/<version>/bin/zeroclaw
-    let prefix = if path_str.contains("/Cellar/") {
-        // Walk up from .../Cellar/zeroclaw/<ver>/bin/zeroclaw to the prefix
-        let mut ancestor = exe.to_path_buf();
-        while let Some(parent) = ancestor.parent() {
-            ancestor = parent.to_path_buf();
-            if ancestor.file_name().is_some_and(|n| n == "Cellar") {
-                // prefix is one level above Cellar
-                return ancestor.parent().map(|p| p.join("var").join("zeroclaw"));
-            }
-        }
-        return None;
-    } else if let Some(bin_parent) = exe.parent() {
+    if let Some(parent) = exe.parent()
+        && parent.file_name() == Some(std::ffi::OsStr::new("bin"))
+        && let Some(prefix) = parent.parent()
+    {
         // <prefix>/bin/zeroclaw → check if <prefix>/Cellar exists (Homebrew marker)
-        if let Some(prefix) = bin_parent.parent() {
-            if prefix.join("Cellar").is_dir() {
-                Some(prefix.to_path_buf())
-            } else {
-                None
-            }
-        } else {
-            None
+        if prefix.join("Cellar").is_dir() {
+            let var_dir = prefix.join("var").join("zeroclaw");
+            return Some((
+                var_dir.clone(),
+                var_dir.join("workspace"),
+                ConfigResolutionSource::HomebrewConfigDir,
+            ));
         }
-    } else {
-        None
-    };
-    prefix.map(|p| p.join("var").join("zeroclaw"))
+    }
+
+    None
 }
 
 async fn resolve_runtime_config_dirs(
@@ -10062,19 +10071,8 @@ async fn resolve_runtime_config_dirs(
         ));
     }
 
-    if cfg!(target_os = "macos") {
-        // Ensure the Homebrew var directory exists before launchd tries to use it.
-        // The plist may reference this path for WorkingDirectory and log files.
-        let exe = std::env::current_exe().ok();
-        if let Some(ref exe_path) = exe
-            && let Some(var_dir) = detect_homebrew_var_dir(exe_path)
-        {
-            return Ok((
-                var_dir.clone(),
-                var_dir.join("workspace"),
-                ConfigResolutionSource::EnvWorkspace,
-            ));
-        }
+    if let Some(homebrew_config_dir) = try_resolve_homebrew_config_dirs() {
+        return Ok(homebrew_config_dir);
     }
 
     if let Some((zeroclaw_dir, workspace_dir)) =
