@@ -12859,6 +12859,7 @@ enum ConfigResolutionSource {
     EnvDataDir,
     EnvWorkspaceLegacy,
     DefaultConfigDir,
+    HomebrewConfigDir,
 }
 
 impl ConfigResolutionSource {
@@ -12868,6 +12869,7 @@ impl ConfigResolutionSource {
             Self::EnvDataDir => "ZEROCLAW_DATA_DIR",
             Self::EnvWorkspaceLegacy => "ZEROCLAW_WORKSPACE",
             Self::DefaultConfigDir => "default",
+            Self::HomebrewConfigDir => "homebrew",
         }
     }
 }
@@ -12902,6 +12904,51 @@ fn expand_tilde_path(path: &str) -> PathBuf {
     }
 
     PathBuf::from(expanded_str)
+}
+
+/// Detect if an executable path lives under a macOS Homebrew prefix and return
+/// the Homebrew-managed config directory.
+///
+/// Homebrew can execute ZeroClaw from `<prefix>/Cellar/zeroclaw/<version>/bin/`,
+/// `<prefix>/bin/`, or `<prefix>/opt/zeroclaw/bin/`.
+fn try_resolve_macos_homebrew_config_dir(exe: &Path) -> Option<PathBuf> {
+    let parts = exe.iter().collect::<Vec<_>>();
+    let prefix = match parts.as_slice() {
+        [prefix @ .., cellar, formula, _version, bin, exe_name]
+            if *cellar == std::ffi::OsStr::new("Cellar")
+                && *formula == std::ffi::OsStr::new("zeroclaw")
+                && *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            prefix.iter().collect::<PathBuf>()
+        }
+        [prefix @ .., opt, formula, bin, exe_name]
+            if *opt == std::ffi::OsStr::new("opt")
+                && *formula == std::ffi::OsStr::new("zeroclaw")
+                && *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            let prefix = prefix.iter().collect::<PathBuf>();
+            if !prefix.as_os_str().is_empty() && prefix.join("Cellar").is_dir() {
+                prefix
+            } else {
+                return None;
+            }
+        }
+        [prefix @ .., bin, exe_name]
+            if *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            let prefix = prefix.iter().collect::<PathBuf>();
+            if !prefix.as_os_str().is_empty() && prefix.join("Cellar").is_dir() {
+                prefix
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(prefix.join("var").join("zeroclaw"))
 }
 
 async fn resolve_runtime_config_dirs(
@@ -12989,6 +13036,17 @@ async fn resolve_runtime_config_dirs(
             zeroclaw_dir,
             data_dir,
             ConfigResolutionSource::EnvWorkspaceLegacy,
+        ));
+    }
+
+    if cfg!(target_os = "macos")
+        && let Ok(exe) = std::env::current_exe()
+        && let Some(homebrew_config_dir) = try_resolve_macos_homebrew_config_dir(&exe)
+    {
+        return Ok((
+            homebrew_config_dir.clone(),
+            homebrew_config_dir.join("workspace"),
+            ConfigResolutionSource::HomebrewConfigDir,
         ));
     }
 
@@ -18293,6 +18351,66 @@ wire_api = "ws"
         assert_eq!(resolved_workspace_dir, default_workspace_dir);
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    async fn create_homebrew_prefix() -> TempDir {
+        let prefix = TempDir::new().expect("homebrew prefix temp dir");
+        fs::create_dir_all(prefix.path().join("Cellar"))
+            .await
+            .expect("create Cellar marker");
+        prefix
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_cellar_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix
+            .path()
+            .join("Cellar")
+            .join("zeroclaw")
+            .join("0.7.0")
+            .join("bin")
+            .join("zeroclaw");
+
+        let config_dir =
+            try_resolve_macos_homebrew_config_dir(&exe).expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_prefix_bin_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix.path().join("bin").join("zeroclaw");
+
+        let config_dir =
+            try_resolve_macos_homebrew_config_dir(&exe).expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_opt_bin_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix
+            .path()
+            .join("opt")
+            .join("zeroclaw")
+            .join("bin")
+            .join("zeroclaw");
+
+        let config_dir =
+            try_resolve_macos_homebrew_config_dir(&exe).expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_rejects_non_homebrew_layout() {
+        let prefix = TempDir::new().expect("non-homebrew temp dir");
+        let exe = prefix.path().join("bin").join("zeroclaw");
+
+        assert!(try_resolve_macos_homebrew_config_dir(&exe).is_none());
     }
 
     #[test]
